@@ -178,6 +178,77 @@ def qfCreateProductRFRSwap(
 
 
 ## TODO: Implement qfCreateProductOvernightIndexBasisSwap
+def qfCreateProductOvernightIndexBasisSwap(
+    effective_date: str,
+    term_or_termination_date: str,
+    payment_off_set: str,
+    on_index_1: str,
+    on_index_2: str,
+    spread_over_leg_1: float,
+    pay_or_rec_leg_1: str,
+    notional: float,
+    accrual_period_1: str,
+    accrual_period_2: str,
+    accrual_basis: str,
+    pay_business_day_convention: Optional[str] = "F",
+    pay_holiday_convention: Optional[str] = "USGS",
+    compounding_method: Optional[str] = "compound",
+):
+    """
+    Create an Overnight Index Basis Swap product.
+    
+    Parameters:
+    -----------
+    effective_date : str
+        Start date of the swap
+    term_or_termination_date : str
+        End date or tenor of the swap
+    payment_off_set : str
+        Payment offset (e.g., '2D')
+    on_index_1 : str
+        First overnight index (e.g., 'SOFR-1B')
+    on_index_2 : str
+        Second overnight index (e.g., 'FF-1B')
+    spread_over_leg_1 : float
+        Spread added to leg 1
+    pay_or_rec_leg_1 : str
+        'pay' or 'receive' for leg 1
+    notional : float
+        Notional amount
+    accrual_period_1 : str
+        Accrual period for leg 1 (e.g., '3Y')
+    accrual_period_2 : str
+        Accrual period for leg 2 (e.g., '1M')
+    accrual_basis : str
+        Day count convention (e.g., 'ACT/360')
+    pay_business_day_convention : Optional[str]
+        Business day convention for payment dates
+    pay_holiday_convention : Optional[str]
+        Holiday calendar convention
+    compounding_method : Optional[str]
+        Compounding method ('compound' or 'simple')
+    
+    Returns:
+    --------
+    ProductOvernightIndexBasisSwap
+        The created basis swap product
+    """
+    return ProductOvernightIndexBasisSwap(
+        Date(effective_date),
+        TermOrTerminationDate(term_or_termination_date),
+        Period(payment_off_set),
+        on_index_1,
+        on_index_2,
+        spread_over_leg_1,
+        PayOrReceive(pay_or_rec_leg_1),
+        notional,
+        Period(accrual_period_1),
+        AccrualBasis(accrual_basis),
+        Period(accrual_period_2),
+        BusinessDayConvention(pay_business_day_convention),
+        HolidayConvention(pay_holiday_convention),
+        CompoundingMethod.from_string(compounding_method),
+    )
 
 
 def qfCreateBondSpecs(key: str, parameters: dict) -> BondSpecs:

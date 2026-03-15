@@ -901,54 +901,232 @@ class ValuationEngineProductOvernightIndexBasisSwap(ValuationEngineProduct):
     ):
         super().__init__(model, valuation_parameters_collection, product, request)
 
-        ## TODO
+        # get info from product
+        self.currency_ = product.currency_
+        self.effective_date_ = product.effective_date
+        self.termination_date_ = product.termination_date
+        self.on_index_1_ = product.on_index_1
+        self.on_index_2_ = product.on_index_2
+        self.spread_ = product.spread
+        self.pay_or_rec_ = product.pay_or_rec
+        self.compounding_method = product.compounding_method
+        self.notional_ = product.notional_
+        
+        # leg 1 sign: if receive leg 1, then leg 1 is positive
+        self.floating_leg_1_sign_ = 1.0 if self.pay_or_rec_ == PayOrReceive.RECEIVE else -1.0
+        self.floating_leg_2_sign_ = -self.floating_leg_1_sign_
+
+        # resolve valuation parameters
+        self.vpc_: ValuationParametersCollection = valuation_parameters_collection
+        assert self.vpc_.has_vp_type(FundingIndexParameter._vp_type)
+        self.funding_vp_: FundingIndexParameter = self.vpc_.get_vp_from_build_method_collection(
+            FundingIndexParameter._vp_type
+        )
+        self.funding_index_ = self.funding_vp_.get_funding_index(self.currency_)
+
+        # Create three engines:
+        # 1. Leg 1 WITH spread (index_1 + spread) - use product's floating_leg_1_
+        # 2. Leg 1 WITHOUT spread (index_1 only) - for calculating annuity
+        # 3. Leg 2 (index_2)
+        
+        # Leg 1 with spread (index_1 + spread) - already exists in product
+        self.floating_leg_1_engine_ = ValuationEngineInterestRateStream(
+            self.model_, self.vpc_, product.floating_leg_1_, request
+        )
+        
+        # Create floating_leg_1 without spread (index_1 only)
+        from fixedincomelib.product import InterestRateStream
+        self.floating_leg_1_wo_spread_ = InterestRateStream(
+            effective_date=self.effective_date_,
+            termination_date=self.termination_date_,
+            accrual_period=product.accrual_period_1_,
+            notional=self.notional_,
+            currency=self.currency_,
+            accrual_basis=product.accrual_basis_,
+            buseinss_day_convention=product.pay_business_day_convention_,
+            holiday_convention=product.pay_holiday_convention_,
+            float_index=product.on_index_str_1_,
+            ois_compounding=self.compounding_method,
+            ois_spread=0.0,  # No spread
+            fixing_in_arrear=True,
+            payment_offset=product.pay_offset_,
+            payment_business_day_convention=product.pay_business_day_convention_,
+            payment_holiday_convention=product.pay_holiday_convention_,
+        )
+
+        # engines for the legs
+        self.floating_leg_1_wo_spread_engine_ = ValuationEngineInterestRateStream(
+            self.model_, self.vpc_, self.floating_leg_1_wo_spread_, request
+        )
+        self.floating_leg_2_engine_ = ValuationEngineInterestRateStream(
+            self.model_, self.vpc_, product.floating_leg_2_, request
+        )
+
+        self.float_1_value_ = 0.0
+        self.float_2_value_ = 0.0
+        self.float_1_cash_ = 0.0
+        self.float_2_cash_ = 0.0
+        self.annuity_ = 0.0
+        self.par_rate_or_spread_ = 0.0
 
     @classmethod
     def val_engine_type(cls) -> str:
         return cls.__name__
 
     def calculate_value(self):
-        ## TODO: follow the design pattern of other products, calculate the value of two legs separately, 
-        # This method computes the valuation by treating the swap as two floating legs:
-        # Leg 1 (basis leg)->split into two sub-engines, Leg 2 (reference leg)
-        '''
-        Expected outputs (set as instance attributes):
-        - self.float_1_value_       : total value of Leg 1
-        - self.float_2_value_       : total value of Leg 2
-        - self.float_1_cash_        : total cash of Leg 1
-        - self.float_2_cash_        : total cash of Leg 2
-        - self.value_               : net swap value (signed sum of both legs)
-        - self.cash_                : net cash (signed sum of both legs)
-        - self.annuity_             : annuity factor derived from Leg 1 basis engine
-        - self.par_rate_or_spread_  : fair spread of the swap
-        '''
-        pass
+        # Calculate value for all engines
+        self.floating_leg_1_engine_.calculate_value()  # index_1 + spread
+        self.floating_leg_1_wo_spread_engine_.calculate_value()  # index_1 only
+        self.floating_leg_2_engine_.calculate_value()  # index_2
+        
+        # Extract values
+        float_1_with_spread_value = self.floating_leg_1_engine_.value_  # V1 total
+        float_1_wo_spread_value = self.floating_leg_1_wo_spread_engine_.value_  # V1 without spread
+        float_2_value = self.floating_leg_2_engine_.value_  # V2
+        
+        # Leg 1 total value (already includes spread)
+        self.float_1_value_ = float_1_with_spread_value
+        self.float_2_value_ = float_2_value
+        
+        # Cash flows
+        float_1_with_spread_cash = self.floating_leg_1_engine_.cash_
+        float_2_cash = self.floating_leg_2_engine_.cash_
+        
+        self.float_1_cash_ = float_1_with_spread_cash
+        self.float_2_cash_ = float_2_cash
+
+        # Net swap value (signed)
+        self.value_ = (
+            self.floating_leg_1_sign_ * self.float_1_value_ + 
+            self.floating_leg_2_sign_ * self.float_2_value_
+        )
+        self.cash_ = (
+            self.floating_leg_1_sign_ * self.float_1_cash_ + 
+            self.floating_leg_2_sign_ * self.float_2_cash_
+        )
+        
+        # Annuity calculation: annuity = (V_with_spread - V_wo_spread) / (notional * spread)
+        # This represents the PV of receiving 1bp spread
+        float_1_spread_value = float_1_with_spread_value - float_1_wo_spread_value
+        self.annuity_ = float_1_spread_value / self.notional_ / self.spread_
+        
+        # Par spread: b = (V2 - V1_wo_spread) / (notional * annuity)
+        # This is the spread that makes the swap have zero value
+        self.par_rate_or_spread_ = (float_2_value - float_1_wo_spread_value) / self.notional_ / self.annuity_
 
     def calculate_first_order_risk(
         self, gradient=None, scaler: float = 1.0, accumulate: bool = False
     ) -> None:
         
-        ## TODO: similar to calculate_value, calculate the risk of two legs separately, 
-        # and accumulate the risk into local_grad, then add to input gradient
-        pass
+        local_grad = []
+        self.model_.resize_gradient(local_grad)
+
+        # Calculate risk for all engines and accumulate
+        # Leg 1 (index_1 + spread)
+        self.floating_leg_1_engine_.calculate_first_order_risk(
+            local_grad, scaler=self.floating_leg_1_sign_ * scaler, accumulate=True
+        )
+        
+        # Leg 2 (index_2)
+        self.floating_leg_2_engine_.calculate_first_order_risk(
+            local_grad, scaler=self.floating_leg_2_sign_ * scaler, accumulate=True
+        )
+
+        self.model_.resize_gradient(gradient)
+        if accumulate:
+            for i in range(len(gradient)):
+                gradient[i] += local_grad[i]
+        else:
+            gradient[:] = local_grad
 
     def create_cash_flows_report(self) -> CashflowsReport:
         """
         Generate a CashflowsReport for the Overnight Index Basis Swap.
-
-        This method iterates over both floating legs and adds a row for each cashflow.
-
-        For each cashflow, you will need to extract:
-        - pay_date, notional, discount factor (df), and payoff from the corresponding engine
-        - For Leg 1: combine payoffs from both basis and wo_basis sub-engines
-        - For Leg 2: use payoff and forward rate directly from floating_leg_2_engine_
-
-        Use this_cf.add_row(...) to record each cashflow, then return this_cf.
-
-        ## TODO: Implement the two loops (Leg 1 and Leg 2) described above.
         """
+        this_cf = CashflowsReport()
+
+        # Leg 1 cashflows (index_1 + spread)
+        n_leg1 = self.product_.floating_leg_1_.num_cashflows()
+        for i in range(n_leg1):
+            cf = self.product_.floating_leg_1_.cashflow(i)
             
-        pass
+            pay_date = getattr(cf, "payment_date", None)
+            if pay_date is None:
+                pay_date = cf.last_date
+
+            # Get payoff from leg 1 engine (includes spread)
+            payoff = self.floating_leg_1_engine_.payoffs_[i]
+            
+            # Get forward rate and accrual
+            fwd_rate = self.floating_leg_1_engine_.fwds_[i]
+            accrued_amt = self.floating_leg_1_engine_.accruals_[i]
+            df = self.floating_leg_1_engine_.dfs_[i]
+            
+            # Get index name
+            index_or_fixed = getattr(cf, "on_index", None)
+            index_or_fixed = index_or_fixed.name() if index_or_fixed is not None else None
+
+            this_cf.add_row(
+                0,  # Leg 1
+                self.product_.product_type,
+                self.val_engine_type(),
+                cf.notional,
+                self.floating_leg_1_sign_,
+                pay_date,
+                payoff,
+                (
+                    payoff * df
+                    if self.value_date < pay_date
+                    else (payoff if self.value_date == pay_date else 0.0)
+                ),
+                df,
+                fixing_date=getattr(cf, "termination_date", None),
+                start_date=getattr(cf, "effective_date", None),
+                end_date=getattr(cf, "termination_date", None),
+                accrued=accrued_amt,
+                index_or_fixed=index_or_fixed,
+                index_value=fwd_rate,
+            )
+
+        # Leg 2 cashflows (index_2)
+        n_leg2 = self.product_.floating_leg_2_.num_cashflows()
+        for i in range(n_leg2):
+            cf = self.product_.floating_leg_2_.cashflow(i)
+            
+            pay_date = getattr(cf, "payment_date", None)
+            if pay_date is None:
+                pay_date = cf.last_date
+            
+            index_or_fixed = getattr(cf, "on_index", None)
+            index_or_fixed = index_or_fixed.name() if index_or_fixed is not None else None
+
+            this_cf.add_row(
+                1,  # Leg 2
+                self.product_.product_type,
+                self.val_engine_type(),
+                cf.notional,
+                self.floating_leg_2_sign_,
+                pay_date,
+                self.floating_leg_2_engine_.payoffs_[i],
+                (
+                    self.floating_leg_2_engine_.payoffs_[i] * self.floating_leg_2_engine_.dfs_[i]
+                    if self.value_date < pay_date
+                    else (
+                        self.floating_leg_2_engine_.payoffs_[i]
+                        if self.value_date == pay_date
+                        else 0.0
+                    )
+                ),
+                self.floating_leg_2_engine_.dfs_[i],
+                fixing_date=getattr(cf, "termination_date", None),
+                start_date=getattr(cf, "effective_date", None),
+                end_date=getattr(cf, "termination_date", None),
+                accrued=self.floating_leg_2_engine_.accruals_[i],
+                index_or_fixed=index_or_fixed,
+                index_value=self.floating_leg_2_engine_.fwds_[i],
+            )
+
+        return this_cf
 
     def get_value_and_cash(self) -> PVCashReport:
         report = PVCashReport(self.currency_)
@@ -966,16 +1144,55 @@ class ValuationEngineProductOvernightIndexBasisSwap(ValuationEngineProduct):
         """
         Compute the gradient of the par spread with respect to model parameters.
 
-        Use the par spread formula and the quotient rule:
-            b = (V2 - V1_wo_basis) / annuity
-            where annuity = V1_basis / spread_over_leg_1
+        Par spread formula:
+            b = (V2 - V1_wo_spread) / annuity
+            where annuity = (V1_with_spread - V1_wo_spread) / spread
 
-        Accumulate gradient contributions from each of the three engines
-            using calculate_first_order_risk(..., scaler=..., accumulate=True)
-
-        ## TODO: Implement the steps above.
+        Using quotient and chain rules to compute gradient.
         """
-        pass
+        local_grad = []
+        self.model_.resize_gradient(local_grad)
+
+        # Let N = V2 - V1_wo_spread, A = annuity
+        # b = N / A
+        # db/dx = (1/A) * dN/dx - (N/A^2) * dA/dx
+        #       = (1/A) * (dV2/dx - dV1_wo/dx) - (N/A^2) * dA/dx
+        # 
+        # where A = (V1_with - V1_wo) / spread
+        # dA/dx = (1/spread) * (dV1_with/dx - dV1_wo/dx)
+        #
+        # Substituting:
+        # db/dx = (1/A) * dV2/dx 
+        #       - (1/A) * dV1_wo/dx
+        #       - (N/A^2/spread) * (dV1_with/dx - dV1_wo/dx)
+        #       = (1/A) * dV2/dx
+        #       - [(1/A) - N/(A^2*spread)] * dV1_wo/dx
+        #       - (N/A^2/spread) * dV1_with/dx
+
+        a = self.annuity_
+        v1_with = self.floating_leg_1_engine_.value_
+        v1_wo = self.floating_leg_1_wo_spread_engine_.value_
+        v2 = self.floating_leg_2_engine_.value_
+        numerator = v2 - v1_wo
+
+        # Contribution from V2: (1/A) * dV2/dx
+        self.floating_leg_2_engine_.calculate_first_order_risk(
+            local_grad, scaler=1.0 / a, accumulate=True
+        )
+
+        # Contribution from V1_wo_spread: -[(1/A) - N/(A^2*spread)] * dV1_wo/dx
+        scaler_v1_wo = -((1.0 / a) - numerator / (a * a * self.spread_))
+        self.floating_leg_1_wo_spread_engine_.calculate_first_order_risk(
+            local_grad, scaler=scaler_v1_wo, accumulate=True
+        )
+
+        # Contribution from V1_with_spread: -(N/A^2/spread) * dV1_with/dx
+        scaler_v1_with = -numerator / (a * a * self.spread_)
+        self.floating_leg_1_engine_.calculate_first_order_risk(
+            local_grad, scaler=scaler_v1_with, accumulate=True
+        )
+
+        return local_grad
 
 class ValuationEngineProductFXForward(ValuationEngineProduct):
 
@@ -1330,6 +1547,14 @@ ValuationEngineProductRegistry().register(
 )
 
 ##TODO: register Overnight Index Basis Swap engine after implementation
+ValuationEngineProductRegistry().register(
+    (
+        YieldCurve._model_type.to_string(),
+        ProductOvernightIndexBasisSwap._product_type,
+        AnalyticValParam._vp_type,
+    ),
+    ValuationEngineProductOvernightIndexBasisSwap,
+)
 
 ValuationEngineProductRegistry().register(
     (
